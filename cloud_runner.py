@@ -13,6 +13,8 @@ from googleapiclient.http import MediaFileUpload
 STATE_FILE = Path("pipeline-state.json")
 VIDEO_FILE = Path("output.mp4")
 AUDIO_FILE = Path("voiceover.mp3")
+SUBS_FILE = Path("captions.vtt")
+BG_VIDEO_FILE = Path("background.mp4")
 
 def load_state():
     return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -38,7 +40,7 @@ def load_skill_context():
     context_parts = []
     for skill_name in ["yt-script", "yt-package"]:
         for path in Path(".").rglob(f"*{skill_name}*/SKILL.md"):
-            context_parts.append(path.read_text(encoding="utf-8")[:3000])
+            context_parts.append(path.read_text(encoding="utf-8")[:2500])
     return "\n\n".join(context_parts)
 
 def call_free_llm(prompt):
@@ -57,12 +59,9 @@ def call_free_llm(prompt):
         timeout=120,
     )
     if response.status_code == 429 or response.status_code >= 500:
-        print(f"Rate limit reached ({response.status_code}): {response.text}")
-        print("Saving progress to resume on the next run.")
+        print(f"Rate limit reached ({response.status_code}). Saving progress for next run.")
         sys.exit(0)
-    if not response.ok:
-        print(f"OpenRouter API error ({response.status_code}): {response.text}")
-        response.raise_for_status()
+    response.raise_for_status()
 
     content = response.json()["choices"][0]["message"]["content"]
     match = re.search(r"\{.*\}", content, re.DOTALL)
@@ -73,47 +72,110 @@ def call_free_llm(prompt):
 def step_generate_script(state):
     skill_rules = load_skill_context()
     prompt = f"""
-    Follow these YouTube skill guidelines:
+    Follow these YouTube hook and retention rules:
     {skill_rules}
 
-    Create a YouTube video for this exact topic: {state['active_topic']}
+    Write a fast-paced YouTube Short (35 to 45 seconds long) for this topic: {state['active_topic']}
     Channel Niche: {state['niche']}
 
-    Return ONLY valid JSON (no extra commentary) with these exact keys:
+    STRICT SHORTS RULES:
+    1. "script_text" MUST be between 90 and 110 spoken words total (this equals exactly 35 to 45 seconds of speech).
+    2. Start with a 1-sentence scroll-stopping hook in the first 3 seconds.
+    3. Write ONLY spoken words in "script_text" (no [brackets], no scene directions, no emojis).
+    4. Include "#Shorts" at the end of the title and inside the description.
+    5. Include "search_keyword": a 1 to 2 word visual noun (like "technology", "coding", "robot", "money") to search for background stock video.
+
+    Return ONLY valid JSON with these exact keys:
     {{
-      "title": "High-CTR YouTube title under 70 chars",
-      "description": "SEO YouTube description with timestamps and tags",
-      "script_text": "Spoken voiceover narration only (plain text, no stage directions)"
+      "title": "Catchy Short Title under 60 chars #Shorts",
+      "description": "Short punchy description with hashtags #Shorts",
+      "script_text": "90 to 110 words of spoken voiceover narration...",
+      "search_keyword": "technology"
     }}
     """
     result = call_free_llm(prompt)
-    state["title"] = result["title"]
-    state["description"] = result["description"]
+    title = result["title"]
+    if "#shorts" not in title.lower():
+        title = f"{title[:85]} #Shorts"
+
+    state["title"] = title
+    state["description"] = result["description"] + "\n\n#Shorts"
     state["script_text"] = result["script_text"]
+    state["search_keyword"] = result.get("search_keyword", "technology")
     state["current_stage"] = "video"
     save_state(state)
 
+def download_vertical_broll(keyword):
+    pexels_key = os.environ.get("PEXELS_API_KEY", "").strip()
+    if not pexels_key:
+        return False
+    try:
+        r = requests.get(
+            "https://api.pexels.com/videos/search",
+            headers={"Authorization": pexels_key},
+            params={"query": keyword, "orientation": "portrait", "size": "medium", "per_page": 5},
+            timeout=30,
+        )
+        videos = r.json().get("videos", [])
+        for v in videos:
+            for vf in v.get("video_files", []):
+                if vf.get("height", 0) >= vf.get("width", 0) and vf.get("link"):
+                    vid_data = requests.get(vf["link"], timeout=60).content
+                    BG_VIDEO_FILE.write_bytes(vid_data)
+                    return True
+    except Exception as e:
+        print(f"Pexels download skipped ({e}), using fallback vertical canvas.")
+    return False
+
 def step_render_video(state):
+    # 1. Generate energetic voiceover AND word-timed subtitles (.vtt)
     subprocess.run(
         [
             "edge-tts",
             "--voice", "en-US-ChristopherNeural",
+            "--rate=+8%",
             "--text", state["script_text"],
             "--write-media", str(AUDIO_FILE),
+            "--write-subtitles", str(SUBS_FILE),
         ],
         check=True,
     )
-    subprocess.run(
-        [
+
+    # 2. Download vertical 9:16 Pexels stock video if key is provided
+    has_broll = download_vertical_broll(state.get("search_keyword", "technology"))
+
+    # 3. Render 1080x1920 (9:16 vertical Short) capped at 48 seconds max with burned-in captions
+    vf_filter = (
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,"
+        "drawbox=x=0:y=0:w=1080:h=1920:color=black@0.35:t=fill,"
+        f"subtitles={SUBS_FILE}:force_style='Alignment=10,Fontname=DejaVu Sans,Fontsize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1'"
+    )
+
+    if has_broll and BG_VIDEO_FILE.exists():
+        cmd = [
             "ffmpeg", "-y",
-            "-f", "lavfi", "-i", "color=c=0x111827:s=1920x1080:r=30",
+            "-stream_loop", "-1", "-i", str(BG_VIDEO_FILE),
             "-i", str(AUDIO_FILE),
-            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-shortest",
+            "-vf", vf_filter,
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest", "-t", "48",
             str(VIDEO_FILE),
-        ],
-        check=True,
-    )
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "color=c=0x0f172a:s=1080x1920:r=30",
+            "-i", str(AUDIO_FILE),
+            "-vf", f"subtitles={SUBS_FILE}:force_style='Alignment=10,Fontname=DejaVu Sans,Fontsize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2'",
+            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest", "-t", "48",
+            str(VIDEO_FILE),
+        ]
+
+    subprocess.run(cmd, check=True)
     state["current_stage"] = "upload"
     save_state(state)
 
@@ -152,10 +214,9 @@ def step_upload_and_schedule(state):
     state["description"] = ""
     state["script_text"] = ""
     state["current_stage"] = "idle"
-    if VIDEO_FILE.exists():
-        VIDEO_FILE.unlink()
-    if AUDIO_FILE.exists():
-        AUDIO_FILE.unlink()
+    for f in [VIDEO_FILE, AUDIO_FILE, SUBS_FILE, BG_VIDEO_FILE]:
+        if f.exists():
+            f.unlink()
     save_state(state)
 
 def main():
