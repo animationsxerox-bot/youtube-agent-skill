@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import requests
@@ -41,8 +42,8 @@ def load_skill_context():
     return "\n\n".join(context_parts)
 
 def call_free_llm(prompt):
-    api_key = os.environ["LLM_API_KEY"]
-    model = os.environ.get("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    api_key = os.environ["LLM_API_KEY"].strip()
+    model = os.environ.get("LLM_MODEL", "openrouter/free")
     response = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -52,15 +53,22 @@ def call_free_llm(prompt):
         json={
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
         },
         timeout=120,
     )
     if response.status_code == 429 or response.status_code >= 500:
-        print(f"Rate limit reached ({response.status_code}). Saving progress for next run.")
+        print(f"Rate limit reached ({response.status_code}): {response.text}")
+        print("Saving progress to resume on the next run.")
         sys.exit(0)
-    response.raise_for_status()
-    return json.loads(response.json()["choices"][0]["message"]["content"])
+    if not response.ok:
+        print(f"OpenRouter API error ({response.status_code}): {response.text}")
+        response.raise_for_status()
+
+    content = response.json()["choices"][0]["message"]["content"]
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if not match:
+        raise ValueError(f"AI did not return JSON. Raw output: {content}")
+    return json.loads(match.group(0))
 
 def step_generate_script(state):
     skill_rules = load_skill_context()
@@ -71,10 +79,12 @@ def step_generate_script(state):
     Create a YouTube video for this exact topic: {state['active_topic']}
     Channel Niche: {state['niche']}
 
-    Return ONLY valid JSON with these exact keys:
-    "title": "High-CTR YouTube title under 70 chars",
-    "description": "SEO YouTube description with timestamps and tags",
-    "script_text": "Spoken voiceover narration only (no stage directions)"
+    Return ONLY valid JSON (no extra commentary) with these exact keys:
+    {{
+      "title": "High-CTR YouTube title under 70 chars",
+      "description": "SEO YouTube description with timestamps and tags",
+      "script_text": "Spoken voiceover narration only (plain text, no stage directions)"
+    }}
     """
     result = call_free_llm(prompt)
     state["title"] = result["title"]
@@ -111,10 +121,10 @@ def step_upload_and_schedule(state):
     next_date_str, publish_at_iso = get_next_publish_timestamp(state)
     creds = Credentials(
         None,
-        refresh_token=os.environ["YT_REFRESH_TOKEN"],
+        refresh_token=os.environ["YT_REFRESH_TOKEN"].strip(),
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.environ["YT_CLIENT_ID"],
-        client_secret=os.environ["YT_CLIENT_SECRET"],
+        client_id=os.environ["YT_CLIENT_ID"].strip(),
+        client_secret=os.environ["YT_CLIENT_SECRET"].strip(),
     )
     youtube = build("youtube", "v3", credentials=creds)
     body = {
