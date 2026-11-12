@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       topic:
-        description: 'Topic for the video'
+        description: 'Topic for the Short'
         required: false
         type: string
   schedule:
@@ -28,15 +28,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg and Python packages
+      - name: Install FFmpeg, Fonts, and Python packages
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
+          sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
           pip install requests edge-tts google-api-python-client google-auth google-auth-oauthlib
 
-      - name: Run Pipeline and Schedule Next-Day Upload
+      - name: Run Shorts Pipeline and Schedule Next-Day Upload
         env:
           INPUT_TOPIC: ${{ github.event.issue.title || github.event.inputs.topic || '' }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
