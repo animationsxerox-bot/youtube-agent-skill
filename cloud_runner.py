@@ -79,11 +79,11 @@ def step_generate_script(state):
     Channel Niche: {state['niche']}
 
     STRICT SHORTS RULES:
-    1. "script_text" MUST be between 90 and 110 spoken words total (this equals exactly 35 to 45 seconds of speech).
+    1. "script_text" MUST be between 90 and 110 spoken words total (this equals 35 to 45 seconds of speech).
     2. Start with a 1-sentence scroll-stopping hook in the first 3 seconds.
     3. Write ONLY spoken words in "script_text" (no [brackets], no scene directions, no emojis).
     4. Include "#Shorts" at the end of the title and inside the description.
-    5. Include "search_keyword": a 1 to 2 word visual noun (like "technology", "coding", "robot", "money") to search for background stock video.
+    5. Include "search_keyword": a 1-word visual noun (like "technology", "computer", "robot", "city") to search for background stock video.
 
     Return ONLY valid JSON with these exact keys:
     {{
@@ -105,26 +105,33 @@ def step_generate_script(state):
     state["current_stage"] = "video"
     save_state(state)
 
-def download_vertical_broll(keyword):
-    pexels_key = os.environ.get("PEXELS_API_KEY", "").strip()
-    if not pexels_key:
+def download_stock_broll(keyword):
+    stock_key = (os.environ.get("PIXABAY_API_KEY") or os.environ.get("PEXELS_API_KEY") or "").strip()
+    if not stock_key:
+        print("No stock video API key found, using animated fallback canvas.")
         return False
+
     try:
-        r = requests.get(
-            "https://api.pexels.com/videos/search",
-            headers={"Authorization": pexels_key},
-            params={"query": keyword, "orientation": "portrait", "size": "medium", "per_page": 5},
-            timeout=30,
-        )
-        videos = r.json().get("videos", [])
-        for v in videos:
-            for vf in v.get("video_files", []):
-                if vf.get("height", 0) >= vf.get("width", 0) and vf.get("link"):
-                    vid_data = requests.get(vf["link"], timeout=60).content
-                    BG_VIDEO_FILE.write_bytes(vid_data)
-                    return True
+        for query_term in [keyword, "technology", "abstract"]:
+            r = requests.get(
+                "https://pixabay.com/api/videos/",
+                params={"key": stock_key, "q": query_term, "per_page": 10, "safesearch": "true"},
+                timeout=30,
+            )
+            if not r.ok:
+                continue
+            hits = r.json().get("hits", [])
+            for hit in hits:
+                videos = hit.get("videos", {})
+                for quality in ["medium", "large", "small"]:
+                    video_url = videos.get(quality, {}).get("url")
+                    if video_url:
+                        vid_data = requests.get(video_url, timeout=60).content
+                        BG_VIDEO_FILE.write_bytes(vid_data)
+                        print(f"Downloaded Pixabay video for keyword: {query_term}")
+                        return True
     except Exception as e:
-        print(f"Pexels download skipped ({e}), using fallback vertical canvas.")
+        print(f"Pixabay download skipped ({e}), using fallback vertical canvas.")
     return False
 
 def step_render_video(state):
@@ -141,8 +148,8 @@ def step_render_video(state):
         check=True,
     )
 
-    # 2. Download vertical 9:16 Pexels stock video if key is provided
-    has_broll = download_vertical_broll(state.get("search_keyword", "technology"))
+    # 2. Download Pixabay background video
+    has_broll = download_stock_broll(state.get("search_keyword", "technology"))
 
     # 3. Render 1080x1920 (9:16 vertical Short) capped at 48 seconds max with burned-in captions
     vf_filter = (
